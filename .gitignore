@@ -1,0 +1,23 @@
+# Build artifacts
+dist/
+build/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Development notes
+.temp/
+CLAUDE.md
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
