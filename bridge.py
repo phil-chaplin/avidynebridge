@@ -248,24 +248,28 @@ class SimConnectSource:
     """Reads SimVars from MSFS via SimConnect. Reconnects automatically."""
 
     RETRY_INTERVAL = 5  # seconds between connection attempts
+    READ_INTERVAL = 0.2  # seconds between SimVar read sweeps
 
     def __init__(self):
         self.sm = None
         self.aq = None
         self.ae = None
-        self._cache = {}
-        self._cache_time = 0
-        self._cache_ttl = 0.05
+        self._simvar_cache = {}   # {simvar_name: raw_value}
         self._lock = threading.Lock()
         self._connected = False
+        self._has_data = False
         self._connect_thread = threading.Thread(
             target=self._connection_loop, daemon=True)
         self._connect_thread.start()
 
+    @property
+    def is_ready(self):
+        return self._connected and self._has_data
+
     def _try_connect(self):
         from SimConnect import SimConnect, AircraftRequests, AircraftEvents
         self.sm = SimConnect()
-        self.aq = AircraftRequests(self.sm, _time=50)
+        self.aq = AircraftRequests(self.sm, _time=0)
         self.ae = AircraftEvents(self.sm)
         self._connected = True
 
@@ -275,32 +279,45 @@ class SimConnectSource:
             try:
                 self._try_connect()
                 log.info("Connected to MSFS.")
-            except Exception:
+            except Exception as e:
                 if not logged_waiting:
-                    log.info("Waiting for MSFS... (retrying every %ds)",
-                             self.RETRY_INTERVAL)
+                    log.info("Waiting for MSFS... (%s)", e)
                     logged_waiting = True
+                else:
+                    log.debug("SimConnect error: %s", e)
                 time.sleep(self.RETRY_INTERVAL)
+        # Connected — start the background reader
+        self._read_thread = threading.Thread(
+            target=self._read_loop, daemon=True)
+        self._read_thread.start()
+
+    def _read_loop(self):
+        """Background thread: continuously reads all mapped SimVars."""
+        simvars = list({m[0] for m in DATAREF_MAP.values() if m is not None})
+        while self._connected:
+            snapshot = {}
+            try:
+                for sv in simvars:
+                    snapshot[sv] = self.aq.get(sv)
+            except Exception:
+                self._handle_disconnect()
+                return
+            with self._lock:
+                self._simvar_cache = snapshot
+                if not self._has_data:
+                    self._has_data = True
+                    log.info("MSFS data ready (%d SimVars).", len(snapshot))
+            time.sleep(self.READ_INTERVAL)
 
     def get(self, simvar_name):
-        """Read a SimVar value. Returns float or None."""
-        if not self._connected:
-            return None
-        try:
-            return self.aq.get(simvar_name)
-        except Exception:
-            self._handle_disconnect()
-            return None
+        """Read a cached SimVar value. Returns float or None."""
+        with self._lock:
+            return self._simvar_cache.get(simvar_name)
 
     def get_state(self, subscribed_drefs):
         """Return {dataref_name: float_value} for all subscribed datarefs."""
-        if not self._connected:
-            return {dref: 0.0 for dref in subscribed_drefs}
-
-        now = time.time()
         with self._lock:
-            if now - self._cache_time < self._cache_ttl:
-                return dict(self._cache)
+            raw_cache = dict(self._simvar_cache)
 
         state = {}
         for dref in subscribed_drefs:
@@ -309,12 +326,8 @@ class SimConnectSource:
                 state[dref] = 0.0
             else:
                 simvar, convert = mapping
-                raw = self.get(simvar)
+                raw = raw_cache.get(simvar)
                 state[dref] = convert(raw)
-
-        with self._lock:
-            self._cache = state
-            self._cache_time = now
         return state
 
     def write_dref(self, dref, value):
@@ -361,6 +374,7 @@ class SimConnectSource:
         if not self._connected:
             return
         self._connected = False
+        self._has_data = False
         log.warning("Lost connection to MSFS. Reconnecting...")
         try:
             self.sm.exit()
@@ -390,6 +404,10 @@ class FakeSource:
         self.center_lat = -33.8568
         self.center_lon = 151.2153
         log.info("Using FAKE data source (no MSFS).")
+
+    @property
+    def is_ready(self):
+        return True
 
     def get_state(self, subscribed_drefs):
         t = time.time() - self.t0
@@ -593,7 +611,7 @@ def responder_thread(sock, subs, source):
     tick_count = 0
     last_debug = 0
     last_com1 = 0
-
+    pkt_count = 0
     # Send cycle at ~60 Hz base rate, but only send each group at its own rate
     BASE_TICK = 0.016  # ~60 Hz base loop
 
@@ -601,7 +619,7 @@ def responder_thread(sock, subs, source):
         tick_count += 1
         all_subs, client_addr = subs.get_all()
 
-        if all_subs and client_addr:
+        if all_subs and client_addr and source.is_ready:
             dref_names = [dref for dref, freq in all_subs.values()]
             state = source.get_state(dref_names)
 
@@ -623,7 +641,11 @@ def responder_thread(sock, subs, source):
                 interval = max(1, int(round((1.0 / BASE_TICK) / freq)))
                 if tick_count % interval == 0:
                     pkt = build_rref_reply(values)
-                    sock.sendto(pkt, client_addr)
+                    try:
+                        sock.sendto(pkt, client_addr)
+                        pkt_count += 1
+                    except Exception as e:
+                        log.warning("Send failed to %s: %s", client_addr, e)
 
             # Log once when subscriptions arrive
             if len(all_subs) != logged_count:
@@ -639,13 +661,22 @@ def responder_thread(sock, subs, source):
             now = time.time()
             if now - last_debug > 5.0 and state:
                 last_debug = now
+                lat = state.get("sim/flightmodel/position/latitude", 0)
+                lon = state.get("sim/flightmodel/position/longitude", 0)
+                elev = state.get("sim/flightmodel/position/elevation", 0)
+                vx = state.get("sim/flightmodel/position/local_vx", 0)
+                vy = state.get("sim/flightmodel/position/local_vy", 0)
+                vz = state.get("sim/flightmodel/position/local_vz", 0)
+                alt = state.get("sim/cockpit2/gauges/indicators/altitude_ft_pilot", 0)
                 com1 = state.get("sim/cockpit2/radios/actuators/com1_frequency_hz", 0)
                 com1s = state.get("sim/cockpit2/radios/actuators/com1_standby_frequency_hz", 0)
-                alt = state.get("sim/cockpit2/gauges/indicators/altitude_ft_pilot", 0)
                 hdef = state.get("sim/cockpit/radios/nav1_hdef_dot", 0)
                 vdef = state.get("sim/cockpit/radios/nav1_vdef_dot", 0)
-                log.debug("alt=%.0fft com1=%.0f/%.0f cdi=%.2f/%.2fdots",
-                           alt, com1, com1s, hdef, vdef)
+                log.debug("pos=%.4f/%.4f elev=%.1fm vel=%.1f/%.1f/%.1f "
+                          "alt=%.0fft com1=%.0f/%.0f pkts=%d -> %s:%d",
+                          lat, lon, elev, vx, vy, vz,
+                          alt, com1, com1s, pkt_count,
+                          client_addr[0], client_addr[1])
                 if com1 != last_com1 and last_com1 != 0:
                     log.debug("COM1 changed: %.0f -> %.0f", last_com1, com1)
                 last_com1 = com1

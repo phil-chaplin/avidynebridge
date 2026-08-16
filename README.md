@@ -32,11 +32,13 @@ AvidyneBridge.exe --fake                  # test mode (no MSFS needed)
 AvidyneBridge.exe --log bridge.log        # write detailed log to file
 ```
 
-1. Run the bridge (it will wait for MSFS if it isn't running yet)
-2. Start MSFS and load into a flight
+1. Start MSFS and load into a flight
+2. Run the bridge — wait for "Connected to MSFS" in the console
 3. Open the IFD Trainer XP app on the iPad — it should connect automatically
 
-The bridge can be started before or after MSFS — it will connect automatically when MSFS becomes available, and reconnect if MSFS is restarted.
+**Important:** Start MSFS and the bridge before opening the app. The app loads initial values (radios, altitude) at connection time — if it connects before MSFS data is available, it may show incorrect values or TAWS errors. If this happens, close and reopen the app.
+
+The bridge will reconnect automatically if MSFS is restarted, but the app should be reopened afterward.
 
 ## What works
 
@@ -60,9 +62,10 @@ The bridge can be started before or after MSFS — it will connect automatically
 - Try specifying your LAN IP: `AvidyneBridge.exe 192.168.x.x`
 - Make sure X-Plane is not running (it also uses port 49000)
 
-**App connects but shows no data:**
+**App connects but shows no data / TAWS errors:**
 - Make sure MSFS is running and loaded into a flight (not the menu)
 - Check the bridge console — it should say "Connected to MSFS"
+- Close and reopen the app — it must connect after MSFS data is flowing
 
 **Detailed diagnostics:**
 - Run with `--log bridge.log` and check the log file
